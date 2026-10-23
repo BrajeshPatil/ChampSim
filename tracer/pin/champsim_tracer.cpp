@@ -28,6 +28,7 @@
 
 #include "../../inc/trace_instruction.h"
 #include "pin.H"
+#include <vector>
 
 using trace_instr_format_t = input_instr;
 
@@ -46,6 +47,12 @@ static std::atomic<bool> mainImageLoaded(false);
 std::ofstream outfile;
 
 trace_instr_format_t curr_instr;
+
+std::vector<unsigned char> curr_read_data;
+std::vector<unsigned char> curr_write_data;
+
+bool should_write_current_instruction = false;
+bool instruction_pending = false;
 
 /* ===================================================================== */
 // Command line switches
@@ -89,6 +96,11 @@ void ResetCurrentInstruction(VOID* ip)
 {
   curr_instr = {};
   curr_instr.ip = (unsigned long long int)ip;
+
+  curr_read_data.clear();
+  curr_write_data.clear();
+
+  should_write_current_instruction = false;
 }
 
 BOOL ShouldWrite()
@@ -116,11 +128,24 @@ BOOL ShouldWrite()
   return true;
 }
 
+VOID DecideTraceEligibility()
+{
+  should_write_current_instruction = ShouldWrite();
+}
+
 void WriteCurrentInstruction()
 {
   typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
   std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
   outfile.write(buf, sizeof(trace_instr_format_t));
+
+  if (!curr_read_data.empty())
+    outfile.write(reinterpret_cast<const char*>(curr_read_data.data()),
+		  curr_read_data.size());
+
+  if (!curr_write_data.empty())
+    outfile.write(reinterpret_cast<const char*>(curr_write_data.data()),
+		  curr_write_data.size());
 }
 
 void BranchOrNot(UINT32 taken)
@@ -135,6 +160,91 @@ void WriteToSet(T* begin, T* end, UINT32 r)
   auto set_end = std::find(begin, end, 0);
   auto found_reg = std::find(begin, set_end, r); // check to see if this register is already in the list
   *found_reg = r;
+}
+
+VOID RecordMemoryRead(ADDRINT address, UINT32 size)
+{
+  if (!should_write_current_instruction)
+    return;
+
+  if (curr_instr.read_count >= NUM_INSTR_SOURCES) {
+    PIN_ExitProcess(1);
+    return;
+  }
+
+  unsigned int i = curr_instr.read_count;
+
+  curr_instr.source_memory[i] = address;
+  curr_instr.source_memory_size[i] = size;
+
+  std::size_t old_size = curr_read_data.size();
+  curr_read_data.resize(old_size + size);
+
+  std::size_t copied = PIN_SafeCopy(curr_read_data.data() + old_size,
+		                    reinterpret_cast<const VOID*>(address), size);
+
+  if (copied != size) {
+    PIN_ExitProcess(1);
+    return;
+  }
+
+  curr_instr.read_count++;
+}
+
+VOID RecordMemoryWrite(ADDRINT address, UINT32 size)
+{
+  if (!should_write_current_instruction)
+    return;
+
+  if (curr_instr.write_count >= NUM_INSTR_DESTINATIONS) {
+    PIN_ExitProcess(1);
+    return;
+  }
+
+  unsigned int i = curr_instr.write_count;
+
+  curr_instr.destination_memory[i] = address;
+  curr_instr.destination_memory_size[i] = size;
+
+  curr_instr.write_count++;
+}
+
+VOID CaptureMemoryWriteData()
+{
+  for (unsigned int i = 0; i < curr_instr.write_count; i++) {
+    ADDRINT address = curr_instr.destination_memory[i];
+    UINT32 size = curr_instr.destination_memory_size[i];
+
+    std::size_t old_size = curr_write_data.size();
+    curr_write_data.resize(old_size + size);
+
+    std::size_t copied = PIN_SafeCopy(curr_write_data.data() + old_size,
+		                      reinterpret_cast<const VOID*>(address), size);
+
+    if (copied != size) {
+      PIN_ExitProcess(1);
+      return;
+    }
+  }
+}
+
+VOID FinalizePendingInstruction()
+{
+  if (!instruction_pending)
+    return;
+
+  if (should_write_current_instruction) {
+    CaptureMemoryWriteData();
+    WriteCurrentInstruction();
+  }
+
+  instruction_pending = false;
+  should_write_current_instruction = false;
+}
+
+VOID MarkInstructionPending()
+{
+  instruction_pending = true;
 }
 
 VOID StartTracing(VOID* ip)
@@ -210,8 +320,14 @@ VOID ImageLoad(IMG img, VOID* v)
 // Is called for every instruction and instruments reads and writes
 VOID Instruction(INS ins, VOID* v)
 {
+  // Finalize the previous instruction if it could not be finalized at IPOINT_AFTER.
+  INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)FinalizePendingInstruction, IARG_END);
+
   // begin each instruction with this function
   INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)ResetCurrentInstruction, IARG_INST_PTR, IARG_END);
+
+  // Decide whether the current instruction should be included in the trace.
+  INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)DecideTraceEligibility, IARG_END);
 
   // instrument branch instructions
   if (INS_IsBranch(ins))
@@ -238,17 +354,24 @@ VOID Instruction(INS ins, VOID* v)
 
   // Iterate over each memory operand of the instruction.
   for (UINT32 memOp = 0; memOp < memOperands; memOp++) {
+    UINT32 size = INS_MemoryOperandSize(ins, memOp);
     if (INS_MemoryOperandIsRead(ins, memOp))
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)WriteToSet<unsigned long long int>, IARG_PTR, curr_instr.source_memory, IARG_PTR,
-                     curr_instr.source_memory + NUM_INSTR_SOURCES, IARG_MEMORYOP_EA, memOp, IARG_END);
+      // Record the memory read address, access size, and data bytes.
+      INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordMemoryRead,
+		               IARG_MEMORYOP_EA, memOp, IARG_UINT32, size, IARG_END);
+
     if (INS_MemoryOperandIsWritten(ins, memOp))
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)WriteToSet<unsigned long long int>, IARG_PTR, curr_instr.destination_memory, IARG_PTR,
-                     curr_instr.destination_memory + NUM_INSTR_DESTINATIONS, IARG_MEMORYOP_EA, memOp, IARG_END);
+      // Record the memory write address, access size, and data bytes.
+      INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordMemoryWrite,
+		               IARG_MEMORYOP_EA, memOp, IARG_UINT32, size, IARG_END);
   }
 
-  // finalize each instruction with this function
-  INS_InsertIfCall(ins, IPOINT_BEFORE, (AFUNPTR)ShouldWrite, IARG_END);
-  INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)WriteCurrentInstruction, IARG_END);
+  // Mark the current instruction as pending finalization.
+  INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)MarkInstructionPending, IARG_END);
+
+  // Finalize the instruction after execution if IPOINT_AFTER is supported.
+  if (INS_IsValidForIpointAfter(ins))
+    INS_InsertCall(ins, IPOINT_AFTER, (AFUNPTR)FinalizePendingInstruction, IARG_END);
 }
 
 /*!
@@ -258,7 +381,11 @@ VOID Instruction(INS ins, VOID* v)
  * @param[in]   v               value specified by the tool in the
  *                              PIN_AddFiniFunction function call
  */
-VOID Fini(INT32 code, VOID* v) { outfile.close(); }
+VOID Fini(INT32 code, VOID* v)
+{
+  FinalizePendingInstruction();
+  outfile.close();
+}
 
 /*!
  * The main procedure of the tool.

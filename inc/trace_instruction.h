@@ -46,6 +46,16 @@ struct input_instr {
 
   unsigned long long destination_memory[NUM_INSTR_DESTINATIONS]; // output memory
   unsigned long long source_memory[NUM_INSTR_SOURCES];           // input memory
+
+  // size of each memory access (in bytes)
+  unsigned char source_memory_size[NUM_INSTR_SOURCES];
+  unsigned char destination_memory_size[NUM_INSTR_DESTINATIONS];
+
+  // Number of valid source memory entries
+  unsigned char read_count;
+
+  // Number of valid destination memory entries
+  unsigned char write_count;
 };
 
 struct cloudsuite_instr {
