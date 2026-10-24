@@ -26,6 +26,7 @@
 
 #include "instruction.h"
 #include "util/detect.h"
+#include <iostream>
 
 namespace champsim
 {
@@ -88,13 +89,19 @@ class bulk_tracereader
   constexpr static std::size_t refresh_thresh = 1;
   std::deque<ooo_model_instr> instr_buffer;
 
+  bool read_exact(char* buffer, std::size_t size)
+  {
+    trace_file.read(buffer, static_cast<std::streamsize>(size));
+    return static_cast<std::size_t>(trace_file.gcount()) == size;
+  }
+
 public:
   ooo_model_instr operator()();
 
   bulk_tracereader(uint8_t cpu_idx, std::string tf) : cpu(cpu_idx), trace_file(tf) {}
   bulk_tracereader(uint8_t cpu_idx, F&& file) : cpu(cpu_idx), trace_file(std::move(file)) {}
 
-  [[nodiscard]] bool eof() const { return trace_file.eof() && std::size(instr_buffer) <= refresh_thresh; }
+  [[nodiscard]] bool eof() const { return eof_ && instr_buffer.empty(); }
 };
 
 ooo_model_instr apply_branch_target(ooo_model_instr branch, const ooo_model_instr& target);
@@ -110,27 +117,60 @@ void set_branch_targets(It begin, It end)
 template <typename T, typename F>
 ooo_model_instr bulk_tracereader<T, F>::operator()()
 {
-  if (std::size(instr_buffer) <= refresh_thresh) {
-    std::array<T, buffer_size - refresh_thresh> trace_read_buf;
-    std::array<char, std::size(trace_read_buf) * sizeof(T)> raw_buf;
-    std::size_t bytes_read;
+  if (std::size(instr_buffer) <= refresh_thresh && !eof_) {
+    while (instr_buffer.size() < buffer_size) {
+      T raw_instr{};
 
-    // Read from trace file
-    trace_file.read(std::data(raw_buf), std::size(raw_buf));
-    bytes_read = static_cast<std::size_t>(trace_file.gcount());
-    eof_ = trace_file.eof();
+      if (!read_exact(reinterpret_cast<char*>(&raw_instr), sizeof(T))) {
+	if (trace_file.gcount() != 0) {
+	  throw std::runtime_error("Truncated instruction record in trace");
+	}
+        eof_ = true;
+        break;
+      }
 
-    // Transform bytes into trace format instructions
-    std::memcpy(std::data(trace_read_buf), std::data(raw_buf), bytes_read);
+      ooo_model_instr instr{this->cpu, raw_instr};
 
-    // Inflate trace format into core model instructions
-    auto begin = std::begin(trace_read_buf);
-    auto end = std::next(begin, bytes_read / sizeof(T));
-    std::transform(begin, end, std::back_inserter(instr_buffer), [cpu = this->cpu](T t) { return ooo_model_instr{cpu, t}; });
+      if constexpr (std::is_same_v<T, input_instr>) {
+        if (raw_instr.read_count > NUM_INSTR_SOURCES ||
+	    raw_instr.write_count > NUM_INSTR_DESTINATIONS) {
+	  throw std::runtime_error("Invalid memory-operation count in trace");
+	}
+        instr.source_memory_size.assign(raw_instr.source_memory_size,
+		                      raw_instr.source_memory_size + raw_instr.read_count);
+
+        instr.destination_memory_size.assign(raw_instr.destination_memory_size,
+		                raw_instr.destination_memory_size + raw_instr.write_count);
+
+        std::size_t total_read_bytes = 0;
+	for (size_t i = 0; i < instr.source_memory_size.size(); i++)
+          total_read_bytes += instr.source_memory_size[i];
+
+	instr.source_memory_data.resize(total_read_bytes);
+	if (total_read_bytes > 0 &&
+	    !read_exact(reinterpret_cast<char*>(instr.source_memory_data.data()), total_read_bytes)) {
+          throw std::runtime_error("Truncated read-data payload in trace");
+        }
+	std::size_t total_write_bytes = 0;
+	for (size_t i = 0; i < instr.destination_memory_size.size(); i++)
+	  total_write_bytes += instr.destination_memory_size[i];
+
+	instr.destination_memory_data.resize(total_write_bytes);
+	if (total_write_bytes > 0 &&
+	    !read_exact(reinterpret_cast<char*>(instr.destination_memory_data.data()), total_write_bytes)) {
+          throw std::runtime_error("Truncated write-data payload in trace");
+        }
+      }
+      instr_buffer.push_back(std::move(instr));
+    }
 
     // Set branch targets
-    set_branch_targets(std::begin(instr_buffer), std::end(instr_buffer));
+    if (!instr_buffer.empty())
+      set_branch_targets(std::begin(instr_buffer), std::end(instr_buffer));
   }
+
+  if (instr_buffer.empty())
+    throw std::runtime_error("Attempted to read instruction past end of trace");
 
   auto retval = instr_buffer.front();
   instr_buffer.pop_front();

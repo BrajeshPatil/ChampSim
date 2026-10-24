@@ -98,6 +98,14 @@ struct ooo_model_instr : champsim::program_ordered<ooo_model_instr> {
   champsim::address ip{};
   champsim::chrono::clock::time_point ready_time{};
 
+  // Sizes of individual memory operations
+  std::vector<unsigned char> source_memory_size = {};
+  std::vector<unsigned char> destination_memory_size = {};
+
+  // Actual bytes associated with each memory operation
+  std::vector<uint8_t> source_memory_data = {};
+  std::vector<uint8_t> destination_memory_data = {};
+
   bool is_branch = false;
   bool branch_taken = false;
   bool branch_prediction = false;
