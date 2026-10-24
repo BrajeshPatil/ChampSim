@@ -490,17 +490,25 @@ void O3_CPU::do_execution(ooo_model_instr& instr)
 void O3_CPU::do_memory_scheduling(ooo_model_instr& instr)
 {
   // load
-  for (auto& smem : instr.source_memory) {
+  std::size_t read_offset = 0;
+  for (std::size_t i = 0; i < instr.source_memory.size(); ++i) {
+    auto& smem = instr.source_memory[i];
+    const auto size = instr.source_memory_size[i];
+
+    std::vector<uint8_t> bytes(instr.source_memory_data.begin() + read_offset,
+			       instr.source_memory_data.begin() + read_offset + size);
     auto q_entry = std::find_if_not(std::begin(LQ), std::end(LQ), [](const auto& lq_entry) { return lq_entry.has_value(); });
     assert(q_entry != std::end(LQ));
-    q_entry->emplace(smem, instr.instr_id, instr.ip, instr.asid); // add it to the load queue
+    q_entry->emplace(smem, instr.instr_id, instr.ip, instr.asid, size, std::move(bytes)); // add it to the load queue
 
+    read_offset += size;
     // Check for forwarding
     auto sq_it = std::max_element(std::begin(SQ), std::end(SQ), [smem](const auto& lhs, const auto& rhs) {
       return lhs.virtual_address != smem || (rhs.virtual_address == smem && LSQ_ENTRY::program_order(lhs, rhs));
     });
     if (sq_it != std::end(SQ) && sq_it->virtual_address == smem) {
       if (sq_it->fetch_issued) { // Store already executed
+	(*q_entry)->data = sq_it->data;
         (*q_entry)->finish(instr);
         q_entry->reset();
       } else {
@@ -516,8 +524,15 @@ void O3_CPU::do_memory_scheduling(ooo_model_instr& instr)
   }
 
   // store
-  for (auto& dmem : instr.destination_memory) {
-    SQ.emplace_back(dmem, instr.instr_id, instr.ip, instr.asid); // add it to the store queue
+  std::size_t write_offset = 0;
+  for (std::size_t i = 0; i < instr.destination_memory.size(); ++i) {
+    const auto size = instr.destination_memory_size[i];
+    std::vector<uint8_t> bytes(instr.destination_memory_data.begin() + write_offset,
+                              instr.destination_memory_data.begin() + write_offset + size);
+    SQ.emplace_back(instr.destination_memory[i], instr.instr_id, instr.ip,
+		    instr.asid, size, std::move(bytes)); // add it to the store queue
+
+    write_offset += size;
   }
 
   if constexpr (champsim::debug_print) {
@@ -578,6 +593,7 @@ void O3_CPU::do_finish_store(const LSQ_ENTRY& sq_entry)
     assert(dependent.has_value()); // LQ entry is still allocated
     assert(dependent->producer_id == sq_entry.instr_id);
 
+    dependent->data = sq_entry.data;
     dependent->finish(std::begin(ROB), std::end(ROB));
     dependent.reset();
   }
@@ -589,6 +605,8 @@ bool O3_CPU::do_complete_store(const LSQ_ENTRY& sq_entry)
   data_packet.v_address = sq_entry.virtual_address;
   data_packet.instr_id = sq_entry.instr_id;
   data_packet.ip = sq_entry.ip;
+  data_packet.data_size = sq_entry.data_size;
+  data_packet.data_bytes = sq_entry.data;
 
   if constexpr (champsim::debug_print) {
     fmt::print("[SQ] {} instr_id: {} vaddr: {}\n", __func__, data_packet.instr_id, data_packet.v_address);
@@ -603,6 +621,7 @@ bool O3_CPU::execute_load(const LSQ_ENTRY& lq_entry)
   data_packet.v_address = lq_entry.virtual_address;
   data_packet.instr_id = lq_entry.instr_id;
   data_packet.ip = lq_entry.ip;
+  data_packet.data_size = lq_entry.data_size;
 
   if constexpr (champsim::debug_print) {
     fmt::print("[LQ] {} instr_id: {} vaddr: {}\n", __func__, data_packet.instr_id, data_packet.v_address);
@@ -673,6 +692,7 @@ long O3_CPU::handle_memory_return()
   for (champsim::bandwidth l1d_bw{L1D_BANDWIDTH}; l1d_bw.has_remaining() && l1d_it != std::end(L1D_bus.lower_level->returned); l1d_bw.consume(), ++l1d_it) {
     for (auto& lq_entry : LQ) {
       if (lq_entry.has_value() && lq_entry->fetch_issued && champsim::block_number{lq_entry->virtual_address} == champsim::block_number{l1d_it->v_address}) {
+	lq_entry->data = l1d_it->data_bytes;
         lq_entry->finish(std::begin(ROB), std::end(ROB));
         lq_entry.reset();
         ++progress;
@@ -786,8 +806,8 @@ void O3_CPU::print_deadlock()
 }
 // LCOV_EXCL_STOP
 
-LSQ_ENTRY::LSQ_ENTRY(champsim::address addr, champsim::program_ordered<LSQ_ENTRY>::id_type id, champsim::address local_ip, std::array<uint8_t, 2> local_asid)
-    : champsim::program_ordered<LSQ_ENTRY>{id}, virtual_address(addr), ip(local_ip), asid(local_asid)
+LSQ_ENTRY::LSQ_ENTRY(champsim::address addr, champsim::program_ordered<LSQ_ENTRY>::id_type id, champsim::address local_ip, std::array<uint8_t, 2> local_asid, unsigned int local_size, std::vector<uint8_t> local_data)
+    : champsim::program_ordered<LSQ_ENTRY>{id}, virtual_address(addr), data_size(local_size), data(std::move(local_data)), ip(local_ip), asid(local_asid)
 {
 }
 
