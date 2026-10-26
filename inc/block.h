@@ -18,6 +18,7 @@
 #define BLOCK_H
 
 #include "champsim.h"
+#include <vector>
 
 namespace champsim
 {
@@ -29,6 +30,7 @@ struct cache_block {
   champsim::address address{};
   champsim::address v_address{};
   champsim::address data{};
+  std::vector<uint8_t> data_bytes{};
 
   uint32_t pf_metadata = 0;
 };

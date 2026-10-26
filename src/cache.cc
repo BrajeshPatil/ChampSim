@@ -93,15 +93,18 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
 }
 
 CACHE::tag_lookup_type::tag_lookup_type(const request_type& req, bool local_pref, bool skip)
-    : address(req.address), v_address(req.v_address), data(req.data), ip(req.ip), instr_id(req.instr_id), pf_metadata(req.pf_metadata), cpu(req.cpu),
+    : address(req.address), v_address(req.v_address), data(req.data), data_bytes(req.data_bytes), data_size(req.data_size), ip(req.ip), instr_id(req.instr_id), pf_metadata(req.pf_metadata), cpu(req.cpu),
       type(req.type), prefetch_from_this(local_pref), skip_fill(skip), is_translated(req.is_translated), instr_depend_on_me(req.instr_depend_on_me)
 {
 }
 
 CACHE::fill_type::fill_type(const tag_lookup_type& req, champsim::chrono::clock::time_point _time_enqueued)
-    : address(req.address), v_address(req.v_address), ip(req.ip), instr_id(req.instr_id), cpu(req.cpu), type(req.type),
+    : address(req.address), v_address(req.v_address), data_bytes(req.data_bytes), data_size(req.data_size), ip(req.ip), instr_id(req.instr_id), cpu(req.cpu), type(req.type),
       prefetch_from_this(req.prefetch_from_this), time_enqueued(_time_enqueued), instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
 {
+  if (type == access_type::WRITE) {
+    pending_writes.push_back({v_address, data_bytes});
+  }
 }
 
 CACHE::fill_type CACHE::fill_type::merge(fill_type predecessor, fill_type successor)
@@ -122,6 +125,10 @@ CACHE::fill_type CACHE::fill_type::merge(fill_type predecessor, fill_type succes
   retval.instr_depend_on_me = merged_instr;
   retval.to_return = merged_return;
   retval.data_promise = predecessor.data_promise;
+  retval.pending_writes = predecessor.pending_writes;
+  retval.pending_writes.insert(retval.pending_writes.end(),
+			       successor.pending_writes.begin(),
+			       successor.pending_writes.end());
 
   if constexpr (champsim::debug_print) {
     if (successor.type == access_type::PREFETCH) {
@@ -147,7 +154,22 @@ auto CACHE::fill_block(fill_type fill, uint32_t metadata) -> BLOCK
   to_fill.address = fill.address;
   to_fill.v_address = fill.v_address;
   to_fill.data = fill.data_promise->data;
+  to_fill.data_bytes = fill.data_promise->data_bytes;
+  to_fill.data_bytes.resize(std::size_t{1} << static_cast<std::size_t>(OFFSET_BITS));
   to_fill.pf_metadata = metadata;
+
+  if (!fill.pending_writes.empty()) {
+    const auto line_size = to_fill.data_bytes.size();
+    for (const auto& write : fill.pending_writes) {
+      if (write.data_bytes.empty())
+        continue;
+
+    const auto offset = write.v_address.to<std::size_t>() % line_size;
+    auto copy_size = std::min(write.data_bytes.size(), line_size - offset);
+
+    std::copy_n(write.data_bytes.begin(), copy_size, to_fill.data_bytes.begin() + offset);
+    }
+  }
 
   return to_fill;
 }
@@ -193,6 +215,8 @@ bool CACHE::handle_fill(const fill_type& fill)
     writeback_packet.cpu = fill.cpu;
     writeback_packet.address = way->address;
     writeback_packet.data = way->data;
+    writeback_packet.data_size = static_cast<unsigned int>(way->data_bytes.size());
+    writeback_packet.data_bytes = way->data_bytes;
     writeback_packet.instr_id = fill.instr_id;
     writeback_packet.ip = champsim::address{};
     writeback_packet.type = access_type::WRITE;
@@ -236,7 +260,7 @@ bool CACHE::handle_fill(const fill_type& fill)
     sim_stats.total_miss_latency_cycles += (current_time - (fill.time_enqueued + clock_period)) / clock_period;
   sim_stats.fill.increment(std::pair{fill.type, fill.cpu});
 
-  response_type response{fill.address, fill.v_address, fill.data_promise->data, metadata_thru, fill.instr_depend_on_me};
+  response_type response{fill.address, fill.v_address, fill.data_promise->data, metadata_thru, fill.instr_depend_on_me, way != set_end ? way->data_bytes : fill.data_promise->data_bytes};
   for (auto* ret : fill.to_return) {
     ret->push_back(response);
   }
@@ -273,12 +297,37 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   if (hit) {
     sim_stats.hits.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
-    response_type response{handle_pkt.address, handle_pkt.v_address, way->data, metadata_thru, handle_pkt.instr_depend_on_me};
+    if (handle_pkt.type == access_type::WRITE &&
+	!handle_pkt.data_bytes.empty() && !way->data_bytes.empty()) {
+      const auto line_size = way->data_bytes.size();
+      const auto offset = handle_pkt.address.to<std::size_t>() % line_size;
+      const auto copy_size = std::min({static_cast<std::size_t>(handle_pkt.data_size),
+                                      handle_pkt.data_bytes.size(), line_size - offset});
+
+      std::copy_n(handle_pkt.data_bytes.begin(), copy_size,
+                  way->data_bytes.begin() + offset);
+     }
+
+    way->dirty |= (handle_pkt.type == access_type::WRITE);
+
+    std::vector<uint8_t> response_bytes;
+    if (handle_pkt.type == access_type::LOAD) {
+      const auto line_size = way->data_bytes.size();
+      const auto offset = handle_pkt.address.to<std::size_t>() % line_size;
+      const auto copy_size = std::min(static_cast<std::size_t>(handle_pkt.data_size),
+				      line_size - offset);
+
+      response_bytes.assign(way->data_bytes.begin() + offset,
+			    way->data_bytes.begin() + offset + copy_size);
+    }
+    response_type response{handle_pkt.address, handle_pkt.v_address, way->data,
+			   metadata_thru, handle_pkt.instr_depend_on_me,
+			   handle_pkt.type == access_type::LOAD ? response_bytes
+								: way->data_bytes};
+
     for (auto* ret : handle_pkt.to_return) {
       ret->push_back(response);
     }
-
-    way->dirty |= (handle_pkt.type == access_type::WRITE);
 
     // update prefetch stats and reset prefetch bit
     if (useful_prefetch) {
@@ -305,6 +354,8 @@ auto CACHE::mshr_and_forward_packet(const tag_lookup_type& handle_pkt) -> std::p
   fwd_pkt.address = handle_pkt.address;
   fwd_pkt.v_address = handle_pkt.v_address;
   fwd_pkt.data = handle_pkt.data;
+  fwd_pkt.data_bytes = handle_pkt.data_bytes;
+  fwd_pkt.data_size = handle_pkt.data_size;
   fwd_pkt.instr_id = handle_pkt.instr_id;
   fwd_pkt.ip = handle_pkt.ip;
 
@@ -613,9 +664,8 @@ void CACHE::finish_packet(const response_type& packet)
     fmt::print(stderr, "[{}_MSHR] {} cannot find a matching entry! address: {} v_address: {}\n", NAME, __func__, packet.address, packet.v_address);
     assert(0);
   }
-
   // MSHR holds the most updated information about this request
-  fill_type::returned_value finished_value{packet.data, packet.pf_metadata};
+  fill_type::returned_value finished_value{packet.data, packet.data_bytes, packet.pf_metadata};
   mshr_entry->data_promise = champsim::waitable{finished_value, current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY)};
   if constexpr (champsim::debug_print) {
     fmt::print("[{}_MSHR] finish_packet instr_id: {} address: {} data: {} type: {} current: {}\n", this->NAME, mshr_entry->instr_id, mshr_entry->address,

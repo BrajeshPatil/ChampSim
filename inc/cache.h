@@ -61,6 +61,8 @@ class CACHE : public champsim::operable
     champsim::address address;
     champsim::address v_address;
     champsim::address data;
+    std::vector<uint8_t> data_bytes{};
+    unsigned int data_size = 0;
     champsim::address ip;
     uint64_t instr_id;
 
@@ -88,11 +90,21 @@ public:
   struct fill_type {
     champsim::address address;
     champsim::address v_address;
+    std::vector<uint8_t> data_bytes{};
+    unsigned int data_size = 0;
+
+    struct pending_write {
+      champsim::address v_address;
+      std::vector<uint8_t> data_bytes{};
+    };
+    std::vector<pending_write> pending_writes{};
+
     champsim::address ip;
     uint64_t instr_id;
 
     struct returned_value {
       champsim::address data;
+      std::vector<uint8_t> data_bytes{};
       uint32_t pf_metadata;
     };
     champsim::waitable<returned_value> data_promise{};
@@ -126,7 +138,7 @@ public:
   using BLOCK = champsim::cache_block;
 
 private:
-  static BLOCK fill_block(fill_type fill, uint32_t metadata);
+  BLOCK fill_block(fill_type fill, uint32_t metadata);
   using set_type = std::vector<BLOCK>;
 
   std::pair<set_type::iterator, set_type::iterator> get_set_span(champsim::address address);
