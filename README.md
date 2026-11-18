@@ -72,6 +72,6 @@ Generate a trace starting from main (Run from ChampSim Root)
 **Important:** Use a trace generated in the extended data-supported format.
 
 ```
-$ bin/champsim --warmup-instructions 200000000 --simulation-instructions 500000000 ~/path/to/trace
+$ ./bin/champsim --warmup-instructions 200000000 --simulation-instructions 500000000 ~/path/to/trace
 ```
 The number of warmup and simulation instructions given will be the number of instructions retired. Note that the statistics printed at the end of the simulation include only the simulation phase.
