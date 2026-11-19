@@ -36,6 +36,9 @@
 #include "tracereader.h"
 #include "vmem.h"
 
+#include <unordered_set>
+#include <unordered_map>
+
 namespace champsim
 {
 std::vector<phase_stats> main(environment& env, std::vector<phase_info>& phases, std::vector<tracereader>& traces);
@@ -90,6 +93,49 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
   app.add_option("traces", trace_names, "The paths to the traces")->required()->expected(NUM_CPUS)->check(CLI::ExistingFile);
 
   CLI11_PARSE(app, argc, argv);
+
+  if (!knob_cloudsuite) {
+    std::unordered_map<uint64_t, uint8_t> initial_data;
+    std::unordered_set<uint64_t> seen;
+
+    for (uint8_t cpu = 0; cpu < trace_names.size(); ++cpu) {
+      auto reader = get_tracereader(trace_names[cpu], cpu, false, false);
+
+      while (!reader.eof()) {
+        auto instr = reader();
+
+        // Process reads
+        std::size_t read_offset = 0;
+
+        for (std::size_t i = 0; i < instr.source_memory.size(); ++i) {
+          uint64_t va = instr.source_memory[i].to<uint64_t>();
+          auto size = instr.source_memory_size[i];
+
+          if (read_offset + size > instr.source_memory_data.size())
+            throw std::runtime_error("Invalid trace read-data size");
+
+          for (std::size_t j = 0; j < size; ++j) {
+            if (seen.insert(va + j).second) {
+              initial_data[va + j] = instr.source_memory_data[read_offset + j];
+	    }
+          }
+
+          read_offset += size;
+        }
+
+        // Process writes: mark bytes as already accessed
+        for (std::size_t i = 0; i < instr.destination_memory.size(); ++i) {
+          uint64_t va = instr.destination_memory[i].to<uint64_t>();
+
+          for (std::size_t j = 0; j < instr.destination_memory_size[i]; ++j){
+            seen.insert(va + j);
+	  }
+        }
+      }
+    }
+
+    gen_environment.dram_view().set_initial_data(std::move(initial_data));
+  }
 
   init_event_listeners(requested_listeners);
 

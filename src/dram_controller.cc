@@ -27,6 +27,11 @@
 #include "util/span.h"
 #include "util/units.h"
 
+void MEMORY_CONTROLLER::set_initial_data(std::unordered_map<uint64_t, uint8_t>&& data)
+{
+  initial_data = std::move(data);
+}
+
 MEMORY_CONTROLLER::MEMORY_CONTROLLER(champsim::chrono::picoseconds dbus_period, champsim::chrono::picoseconds mc_period, std::size_t t_rp, std::size_t t_rcd,
                                      std::size_t t_cas, std::size_t t_ras, champsim::chrono::microseconds refresh_period, std::vector<channel_type*>&& ul,
                                      std::size_t rq_size, std::size_t wq_size, std::size_t chans, champsim::data::bytes chan_width, std::size_t rows,
@@ -36,14 +41,14 @@ MEMORY_CONTROLLER::MEMORY_CONTROLLER(champsim::chrono::picoseconds dbus_period, 
 {
   for (std::size_t i{0}; i < chans; ++i) {
     channels.emplace_back(dbus_period, mc_period, t_rp, t_rcd, t_cas, t_ras, refresh_period, refreshes_per_period, chan_width, rq_size, wq_size,
-                          address_mapping);
+                          address_mapping, &memory);
   }
 }
 
 DRAM_CHANNEL::DRAM_CHANNEL(champsim::chrono::picoseconds dbus_period, champsim::chrono::picoseconds mc_period, std::size_t t_rp, std::size_t t_rcd,
                            std::size_t t_cas, std::size_t t_ras, champsim::chrono::microseconds refresh_period, std::size_t refreshes_per_period,
-                           champsim::data::bytes width, std::size_t rq_size, std::size_t wq_size, DRAM_ADDRESS_MAPPING addr_mapper)
-    : champsim::operable(mc_period), address_mapping(addr_mapper), WQ{wq_size}, RQ{rq_size}, channel_width(width),
+                           champsim::data::bytes width, std::size_t rq_size, std::size_t wq_size, DRAM_ADDRESS_MAPPING addr_mapper, std::unordered_map<uint64_t, std::vector<uint8_t>>* memory_)
+    : champsim::operable(mc_period), address_mapping(addr_mapper), memory(memory_), WQ{wq_size}, RQ{rq_size}, channel_width(width),
       DRAM_ROWS_PER_REFRESH(address_mapping.rows() / refreshes_per_period), tRP(t_rp * mc_period), tRCD(t_rcd * mc_period), tCAS(t_cas * mc_period),
       tRAS(t_ras * mc_period), tREF(refresh_period / refreshes_per_period),
       tRFC(std::chrono::duration_cast<champsim::chrono::clock::duration>(
@@ -145,8 +150,26 @@ long DRAM_CHANNEL::finish_dbus_request()
   long progress{0};
 
   if (active_request != std::end(bank_request) && active_request->ready_time <= current_time) {
+    auto& request = active_request->pkt->value();
+    if (request.is_write && !request.data_bytes.empty()) {
+      uint64_t pa = request.address.to<uint64_t>();
+      uint64_t line_address = pa - (pa % BLOCK_SIZE);
+
+      auto& line = (*memory)[line_address];
+
+      if (line.empty())
+        line.resize(BLOCK_SIZE, 0);
+
+      std::size_t offset = pa - line_address;
+      std::size_t copy_size = std::min(static_cast<std::size_t>(request.data_size),
+				       request.data_bytes.size());
+
+      copy_size = std::min(copy_size, line.size() - offset);
+      for (std::size_t i = 0; i < copy_size; ++i)
+        line[offset + i] = request.data_bytes[i];
+    }
     response_type response{active_request->pkt->value().address, active_request->pkt->value().v_address, active_request->pkt->value().data,
-                           active_request->pkt->value().pf_metadata, active_request->pkt->value().instr_depend_on_me};
+                           active_request->pkt->value().pf_metadata, active_request->pkt->value().instr_depend_on_me, request.data_bytes, request.data_size};
     for (auto* ret : active_request->pkt->value().to_return) {
       ret->push_back(response);
     }
@@ -260,7 +283,6 @@ long DRAM_CHANNEL::populate_dbus()
       auto bankgroup_ready_time = bankgroup_readytime[op_bankgroup];
 
       active_request = iter_next_process;
-
       // set return time. Incur penalty if bankgroup is on cooldown
       if (bankgroup_ready_time > current_time)
         active_request->ready_time = bankgroup_ready_time + DRAM_DBUS_RETURN_TIME;
@@ -508,7 +530,7 @@ void MEMORY_CONTROLLER::initiate_requests()
 }
 
 DRAM_CHANNEL::request_type::request_type(const typename champsim::channel::request_type& req)
-    : pf_metadata(req.pf_metadata), address(req.address), v_address(req.address), data(req.data), instr_depend_on_me(req.instr_depend_on_me)
+    : pf_metadata(req.pf_metadata), address(req.address), v_address(req.v_address), data(req.data), data_bytes(req.data_bytes), data_size(req.data_size), instr_depend_on_me(req.instr_depend_on_me)
 {
   asid[0] = req.asid[0];
   asid[1] = req.asid[1];
@@ -521,6 +543,31 @@ bool MEMORY_CONTROLLER::add_rq(const request_type& packet, champsim::channel* ul
   if (auto rq_it = std::find_if_not(std::begin(channel.RQ), std::end(channel.RQ), [this](const auto& pkt) { return pkt.has_value(); });
       rq_it != std::end(channel.RQ)) {
     *rq_it = DRAM_CHANNEL::request_type{packet};
+
+    if (packet.type == access_type::LOAD || packet.type == access_type::RFO) {
+      uint64_t pa = packet.address.to<uint64_t>();
+      uint64_t va = packet.v_address.to<uint64_t>();
+
+      uint64_t line_address = pa - (pa % BLOCK_SIZE);
+      uint64_t virtual_line_address = va - (pa - line_address);
+
+      auto& line = memory[line_address];
+
+      if (line.empty())
+        line.resize(BLOCK_SIZE, 0);
+
+      for (std::size_t i = 0; i < BLOCK_SIZE; ++i) {
+        auto it = initial_data.find(virtual_line_address + i);
+
+        if (it != initial_data.end()) {
+          line[i] = it->second;
+          initial_data.erase(it);
+        }
+      }
+      rq_it->value().data_bytes = line;
+      rq_it->value().data_size = static_cast<unsigned int>(line.size());
+    }
+
     rq_it->value().forward_checked = false;
     rq_it->value().scheduled = false;
     rq_it->value().ready_time = current_time;
@@ -541,6 +588,7 @@ bool MEMORY_CONTROLLER::add_wq(const request_type& packet)
   if (auto wq_it = std::find_if_not(std::begin(channel.WQ), std::end(channel.WQ), [](const auto& pkt) { return pkt.has_value(); });
       wq_it != std::end(channel.WQ)) {
     *wq_it = DRAM_CHANNEL::request_type{packet};
+    wq_it->value().is_write = true;
     wq_it->value().forward_checked = false;
     wq_it->value().scheduled = false;
     wq_it->value().ready_time = current_time;

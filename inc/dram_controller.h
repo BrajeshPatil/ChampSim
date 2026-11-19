@@ -34,6 +34,8 @@
 #include "extent_set.h"
 #include "operable.h"
 
+#include <unordered_map>
+
 struct DRAM_ADDRESS_MAPPING {
   constexpr static std::size_t SLICER_OFFSET_IDX = 0;
   constexpr static std::size_t SLICER_CHANNEL_IDX = 1;
@@ -94,6 +96,7 @@ struct DRAM_CHANNEL final : public champsim::operable {
   using response_type = typename champsim::channel::response_type;
 
   const DRAM_ADDRESS_MAPPING address_mapping;
+  std::unordered_map<uint64_t, std::vector<uint8_t>>* memory;
 
   struct request_type {
     bool scheduled = false;
@@ -106,6 +109,9 @@ struct DRAM_CHANNEL final : public champsim::operable {
     champsim::address address{};
     champsim::address v_address{};
     champsim::address data{};
+    bool is_write = false;
+    std::vector<uint8_t> data_bytes{};
+    unsigned int data_size = 0;
     champsim::chrono::clock::time_point ready_time = champsim::chrono::clock::time_point::max();
 
     std::vector<uint64_t> instr_depend_on_me{};
@@ -164,7 +170,7 @@ struct DRAM_CHANNEL final : public champsim::operable {
 
   DRAM_CHANNEL(champsim::chrono::picoseconds dbus_period, champsim::chrono::picoseconds mc_period, std::size_t t_rp, std::size_t t_rcd, std::size_t t_cas,
                std::size_t t_ras, champsim::chrono::microseconds refresh_period, std::size_t refreshes_per_period, champsim::data::bytes width,
-               std::size_t rq_size, std::size_t wq_size, DRAM_ADDRESS_MAPPING addr_mapping);
+               std::size_t rq_size, std::size_t wq_size, DRAM_ADDRESS_MAPPING addr_mapping, std::unordered_map<uint64_t, std::vector<uint8_t>>* memory);
 
   void check_write_collision();
   void check_read_collision();
@@ -199,6 +205,8 @@ class MEMORY_CONTROLLER : public champsim::operable
   bool add_wq(const request_type& packet);
 
   const DRAM_ADDRESS_MAPPING address_mapping;
+  std::unordered_map<uint64_t, uint8_t> initial_data;
+  std::unordered_map<uint64_t, std::vector<uint8_t>> memory;
 
   // data bus period
   champsim::chrono::picoseconds data_bus_period{};
@@ -216,6 +224,7 @@ public:
   void begin_phase() final;
   void end_phase(unsigned cpu) final;
   void print_deadlock() final;
+  void set_initial_data(std::unordered_map<uint64_t, uint8_t>&& data);
 
   [[nodiscard]] champsim::data::bytes size() const;
 };
