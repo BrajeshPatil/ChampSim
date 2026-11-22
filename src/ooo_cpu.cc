@@ -692,7 +692,13 @@ long O3_CPU::handle_memory_return()
   for (champsim::bandwidth l1d_bw{L1D_BANDWIDTH}; l1d_bw.has_remaining() && l1d_it != std::end(L1D_bus.lower_level->returned); l1d_bw.consume(), ++l1d_it) {
     for (auto& lq_entry : LQ) {
       if (lq_entry.has_value() && lq_entry->fetch_issued && champsim::block_number{lq_entry->virtual_address} == champsim::block_number{l1d_it->v_address}) {
-	lq_entry->data = l1d_it->data_bytes;
+        const auto offset = lq_entry->virtual_address.to<std::size_t>() % BLOCK_SIZE;
+        const auto copy_size = std::min(static_cast<std::size_t>(lq_entry->data_size),
+					l1d_it->data_bytes.size() > offset
+					? l1d_it->data_bytes.size() - offset
+					: std::size_t{0});
+        lq_entry->data.assign(l1d_it->data_bytes.begin() + offset,
+			      l1d_it->data_bytes.begin() + offset + copy_size);
         lq_entry->finish(std::begin(ROB), std::end(ROB));
         lq_entry.reset();
         ++progress;
