@@ -102,7 +102,7 @@ CACHE::fill_type::fill_type(const tag_lookup_type& req, champsim::chrono::clock:
     : address(req.address), v_address(req.v_address), data_bytes(req.data_bytes), data_size(req.data_size), ip(req.ip), instr_id(req.instr_id), cpu(req.cpu), type(req.type),
       prefetch_from_this(req.prefetch_from_this), time_enqueued(_time_enqueued), instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
 {
-  if (type == access_type::WRITE) {
+  if (type == access_type::WRITE || type == access_type::RFO) {
     pending_writes.push_back({v_address, data_bytes});
   }
 }
@@ -150,7 +150,7 @@ auto CACHE::fill_block(fill_type fill, uint32_t metadata) -> BLOCK
   CACHE::BLOCK to_fill;
   to_fill.valid = true;
   to_fill.prefetch = fill.prefetch_from_this;
-  to_fill.dirty = (fill.type == access_type::WRITE);
+  to_fill.dirty = (fill.type == access_type::WRITE || fill.type == access_type::RFO);
   to_fill.address = fill.address;
   to_fill.v_address = fill.v_address;
   to_fill.data = fill.data_promise->data;
@@ -310,20 +310,9 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
 
     way->dirty |= (handle_pkt.type == access_type::WRITE);
 
-    std::vector<uint8_t> response_bytes;
-    if (handle_pkt.type == access_type::LOAD) {
-      const auto line_size = way->data_bytes.size();
-      const auto offset = handle_pkt.address.to<std::size_t>() % line_size;
-      const auto copy_size = std::min(static_cast<std::size_t>(handle_pkt.data_size),
-				      line_size - offset);
-
-      response_bytes.assign(way->data_bytes.begin() + offset,
-			    way->data_bytes.begin() + offset + copy_size);
-    }
     response_type response{handle_pkt.address, handle_pkt.v_address, way->data,
 			   metadata_thru, handle_pkt.instr_depend_on_me,
-			   handle_pkt.type == access_type::LOAD ? response_bytes
-								: way->data_bytes};
+			   way->data_bytes, BLOCK_SIZE};
 
     for (auto* ret : handle_pkt.to_return) {
       ret->push_back(response);
